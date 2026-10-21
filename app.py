@@ -11,7 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from qrant import __version__, data, metrics, pipeline, validation
+from qrant import __version__, data, metrics, pipeline, quality, validation
 from qrant import backtest as bt
 from qrant.config import (BENCHMARK_INDEX, BENCHMARK_NAME, DEFAULT_WATCHLIST, CostModel, RiskConfig,
                           is_ashare_equity, is_etf, price_limit)
@@ -164,6 +164,10 @@ def page_signals():
     if not rows:
         st.warning("没有可用的数据。")
         return
+    qc = quality.check_many(frames) if not source.startswith("演示") else pd.DataFrame()
+    if len(qc):
+        st.warning("⚠️ 数据质量问题（错误级别的标的信号不可信）：\n\n" +
+                   "\n".join(f"- {r.代码} {r.级别}：{r.问题}" for r in qc.itertuples()))
 
     t = pd.DataFrame(rows)
     stale = (pd.Timestamp(datetime.now().date()) - pd.to_datetime(t["数据日期"])).dt.days > 5
@@ -217,6 +221,11 @@ def page_signals():
 
 
 # ================================================================== 页面：策略回测
+def cfg_cash() -> float:
+    """随机择时检验与回测用同一现金利率。"""
+    return st.session_state.get("bt_cash", RiskConfig().cash_rate * 100) / 100
+
+
 def page_backtest():
     hero("📈 策略回测", "四线对比：买入持有 · 裸策略 · 风控策略 · 同等平均仓位基准 —— 只有战胜后者才是真本事。")
     with st.container(border=True):
@@ -257,8 +266,20 @@ def page_backtest():
     res, m = a.results, a.metrics
     st.caption(f"标的 **{code} {name_of(code)}** · 区间 {a.start:%Y-%m-%d} ~ {a.df.index[-1]:%Y-%m-%d} · 数据：{src}")
 
+    qc = quality.check(a.df, code, kind) if not source.startswith("演示") else pd.DataFrame()
+    if len(qc):
+        st.warning("⚠️ 数据质量问题，回测结论可能失真：\n\n" +
+                   "\n".join(f"- {r.级别}：{r.日期} {r.问题}" for r in qc.itertuples()))
+
     v = a.verdict
+    rk_res = res["风控策略"]
+    rt = validation.random_timing_test(a.df["close"].pct_change().reindex(rk_res.returns.index),
+                                       rk_res.exposure.shift(1), n_sims=300, cash_rate=cfg_cash())
+    psr = validation.probabilistic_sharpe(rk_res.returns)
     items = "".join(f"<div>{'✅' if ok else '❌'} {k}</div>" for k, ok in v["checks"].items())
+    items += (f"<div>{'✅' if rt['p'] < 0.05 else '➖'} 随机择时检验：p = {rt['p']:.2f}"
+              f"（{'择时显著优于随机平移的同一仓位' if rt['p'] < 0.05 else '与随机择时差别不显著，优势可能来自运气'}）</div>"
+              f"<div>➖ PSR（真实夏普 > 0 的概率）：{pct(psr['psr'], 0)} · 需要至少 {num(psr['min_trl_years'])} 年数据才能确认</div>")
     if v["passed"]:
         st.markdown(f'<div class="q-verdict pass"><b>✅ 通过验收：风控策略具有真实的风险调整后优势</b>'
                     f'<div style="margin-top:6px">{items}</div></div>', unsafe_allow_html=True)
@@ -357,12 +378,12 @@ def page_portfolio():
                 datas, capital, "inv_vol" if method.startswith("反") else "equal",
                 {"多周期动量": "momentum", "200日均线": "ma", "不择时": "none"}[trend], tv, mw,
                 "ME" if freq == "每月" else "W", RiskConfig(breaker_on=True, breaker_dd=0.12) if brk else None)
-        st.session_state["pf"] = (out, datas)
+        st.session_state["pf_out"] = (out, datas)
 
-    if "pf" not in st.session_state:
+    if "pf_out" not in st.session_state:
         st.info("👆 选择资产后点击「计算组合」。默认 6 只 ETF 覆盖 A股大/中/小盘、黄金、国债、美股。")
         return
-    out, datas = st.session_state["pf"]
+    out, datas = st.session_state["pf_out"]
     res, m = out["results"], out["metrics"]
     rk, bh = m["风控组合"], m["等权买入持有"]
     c = st.columns(4)
@@ -433,7 +454,7 @@ def page_robust():
         test_y = c5.slider("检验窗口（年）", 1, 3, 1)
         horizon = c6.selectbox("蒙特卡洛期限", ["1年", "3年"])
         go_btn = st.form_submit_button("🔬 开始检验（约 10~30 秒）", type="primary")
-    if not go_btn and "rb" not in st.session_state:
+    if not go_btn and "rb_out" not in st.session_state:
         st.info("👆 选择标的与策略后开始检验。系统会自动在默认参数附近构造 6×6 参数网格。")
         return
     if go_btn:
@@ -470,10 +491,10 @@ def page_robust():
         ref = rets.get(default_lab, rets[best_lab])
         mc_s = validation.block_bootstrap(ref, 1000, hz)
         mc_b = validation.block_bootstrap(bh, 1000, hz)
-        st.session_state["rb"] = dict(code=code, sk=sk, metric=metric, grid=grid_score, p1=p1, p2=p2, wf=wf,
+        st.session_state["rb_out"] = dict(code=code, sk=sk, metric=metric, grid=grid_score, p1=p1, p2=p2, wf=wf,
                                       rets=rets, bh=bh, best=best_lab, dsr=dsr, mc_s=mc_s, mc_b=mc_b, hz=hz,
                                       default=default_lab if default_lab in rets else best_lab)
-    R = st.session_state["rb"]
+    R = st.session_state["rb_out"]
     t1, t2, t3, t4 = st.tabs(["参数敏感性", "Walk-Forward 样本外", "Deflated Sharpe", "蒙特卡洛回撤"])
     with t1:
         g = R["grid"]
@@ -516,7 +537,11 @@ def page_robust():
     with t3:
         d = R["dsr"]
         ok = d["dsr"] >= 0.95 if not np.isnan(d["dsr"]) else False
-        c = st.columns(3)
+        pb = validation.pbo_cscv(pd.DataFrame(R["rets"]), S=10)["pbo"]
+        c = st.columns(4)
+        with c[3]:
+            card("回测过拟合概率 PBO", pct(pb, 0), "样本内最优在样本外跌到中位数以下的概率；> 50% = 挑参数无效",
+                 "q-good" if pb < 0.3 else "q-bad")
         with c[0]:
             card("Deflated Sharpe（真实概率）", pct(d["dsr"], 1), "≥95% 才可信", "q-good" if ok else "q-bad")
         with c[1]:

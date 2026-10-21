@@ -122,6 +122,12 @@ def _fetch_akshare(symbol: str, kind: str, start: str, end: str, adjust: str) ->
         if fn is not None:
             d = attempt(fn, symbol=_exchange_prefix(c6))
             if d is not None:
+                if adjust == "qfq":  # 新浪 ETF 行情不复权：分红会被当成下跌，必须用新浪复权因子修正
+                    try:
+                        d, notes = adjust_with_sina_factors(d, sina_factors(_exchange_prefix(c6)))
+                        d.attrs["adjust_note"] = "新浪行情+新浪复权因子前复权" + (f"（{len(notes)} 次除权）" if notes else "")
+                    except Exception as ex:  # noqa: BLE001
+                        d.attrs["adjust_note"] = f"⚠ 新浪行情未复权（复权因子获取失败：{str(ex)[:40]}）"
                 return d.loc[pd.Timestamp(start): pd.Timestamp(end)]
     else:
         c6 = code[-6:]
@@ -138,8 +144,61 @@ def _fetch_akshare(symbol: str, kind: str, start: str, end: str, adjust: str) ->
     raise DataError("所有数据接口均失败：\n" + "\n".join(errors[-4:]))
 
 
+def sina_factors(sina_symbol: str) -> pd.DataFrame:
+    """新浪复权因子：每个除权日的累计份额系数 s 与累计每份分红 u（升序）。"""
+    import json
+
+    import requests
+
+    t = requests.get(f"https://finance.sina.com.cn/realstock/company/{sina_symbol}/hfq.js", timeout=15).text
+    body = t[t.index("{"): t.rindex("}") + 1]
+    rows = json.loads(body.split("/*")[0].strip())["data"]
+    f = pd.DataFrame(rows).rename(columns={"d": "date"})
+    f = f[f["date"] != "1900-01-01"]
+    f["date"] = pd.to_datetime(f["date"])
+    f[["s", "u"]] = f[["s", "u"]].astype(float)
+    return f.sort_values("date").reset_index(drop=True)[["date", "s", "u"]]
+
+
+def adjust_with_sina_factors(df: pd.DataFrame, factors: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """把不复权行情转为前复权（最新价不变，历史价按除权比例缩放）。
+
+    - 分红 D：除权日之前价格 × (前收 − D) / 前收
+    - 份额折算（s 变化 k 倍）：之前价格 × 1/k；新浪给出的日期可能早于实际断层 1–2 天，
+      因此在该日及之后 3 个交易日里找开盘缺口最接近 1/k 的那天
+    """
+    df = df.copy()
+    cols = ["open", "high", "low", "close"]
+    ratio = pd.Series(1.0, index=df.index)
+    notes: list[str] = []
+    prev_s, prev_u = 1.0, 0.0
+    for ev in factors.itertuples(index=False):
+        pos = df.index.searchsorted(ev.date)
+        if pos >= len(df) or pos == 0:
+            prev_s, prev_u = ev.s, ev.u
+            continue
+        k = ev.s / prev_s
+        if abs(k - 1) > 1e-6:
+            cand = range(pos, min(pos + 4, len(df)))
+            gaps = {i: abs(df["open"].iloc[i] / df["close"].iloc[i - 1] - 1 / k) for i in cand}
+            i = min(gaps, key=gaps.get)
+            ratio.iloc[:i] *= 1 / k
+            notes.append(f"{df.index[i]:%Y-%m-%d} 份额折算 ×{1 / k:.4f}")
+        div = ev.u - prev_u
+        if div > 1e-9:
+            pc = df["close"].iloc[pos - 1]
+            ratio.iloc[:pos] *= (pc - div) / pc
+            notes.append(f"{df.index[pos]:%Y-%m-%d} 分红 {div:.3f}")
+        prev_s, prev_u = ev.s, ev.u
+    df[cols] = df[cols].mul(ratio, axis=0)
+    return df, notes
+
+
+CACHE_VERSION = "v2"  # v2：新浪回退数据按复权因子修正后再缓存（v1 缓存是新浪不复权数据）
+
+
 def _cache_path(symbol: str, kind: str, adjust: str) -> Path:
-    return CACHE_DIR / f"{kind}_{symbol.strip().lower()}_{adjust or 'none'}.csv"
+    return CACHE_DIR / f"{kind}_{symbol.strip().lower()}_{adjust or 'none'}_{CACHE_VERSION}.csv"
 
 
 SPLIT_THRESHOLD = 0.35  # 单日涨跌超过 ±35%：超出任何 A 股/ETF 涨跌停，只可能是份额拆分/合并未复权
@@ -185,19 +244,26 @@ def fetch(symbol: str, start: str | date = "20100101", end: str | date | None = 
     path = _cache_path(symbol, kind, adjust)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+    note_path = path.with_suffix(".note")
+    cache_src = "本地缓存" + (f"（{note_path.read_text(encoding='utf-8')}）" if note_path.exists() else "")
     fresh = path.exists() and (time.time() - path.stat().st_mtime) < CACHE_TTL_HOURS * 3600
     if fresh and not force:
-        cached = normalize(pd.read_csv(path))  # 缓存里保存的是全部历史（原始数据）
-        return _finish(cached, start_s, end_s, "本地缓存")
+        cached = normalize(pd.read_csv(path))  # 缓存里保存的是全部历史（已复权）
+        return _finish(cached, start_s, end_s, cache_src)
 
     try:
         df = _fetch_akshare(symbol, kind, "19900101", end_s, adjust)
+        note = df.attrs.get("adjust_note", "")
         df.reset_index().to_csv(path, index=False)
-        return _finish(df, start_s, end_s, "AKShare 在线")
+        if note:
+            note_path.write_text(note, encoding="utf-8")
+        else:
+            note_path.unlink(missing_ok=True)
+        return _finish(df, start_s, end_s, "AKShare 在线" + (f"（{note}）" if note else ""))
     except DataError as e:
         if path.exists():
             cached = normalize(pd.read_csv(path))
-            return _finish(cached, start_s, end_s, f"本地缓存（在线失败：{str(e)[:60]}）")
+            return _finish(cached, start_s, end_s, f"{cache_src}（在线失败：{str(e)[:60]}）")
         raise
 
 

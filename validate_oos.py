@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from qrant import data, pipeline, validation
+from qrant import data, pipeline, registry, validation
 from qrant.config import BENCHMARK_INDEX, DEFAULT_WATCHLIST, RiskConfig
 from qrant.metrics import summary
 
@@ -100,6 +100,16 @@ def main(argv: list[str]) -> int:
         "时间段 2020-今（全部标的×策略）": res[res["区间"] == "2020-今"],
     }
 
+    pair_rows = []
+    for name, v in views.items():
+        pv = v.pivot_table(index=["代码", "策略"], columns="方案", values="风控卡玛")
+        for k in ["C", "E"]:
+            t = validation.paired_test(pv[k], pv["B"])
+            pair_rows.append({"视角": name, "对比": f"{k} − B", "组数": t["n"], "卡玛差中位数": t["median_diff"],
+                              "95%置信区间": f"[{t['ci_low']:+.3f}, {t['ci_high']:+.3f}]", "胜出占比": t["win"],
+                              "Wilcoxon p": t["p"]})
+    pairs = pd.DataFrame(pair_rows)
+
     print("[3/4] Walk-Forward …")
     wf_rows, picks = [], []
     for c in datas:
@@ -114,6 +124,7 @@ def main(argv: list[str]) -> int:
             for k in ["B", "C", "E"]:
                 row[f"固定{k}"] = calmar(cand[k].reindex(span).fillna(0))
             row["持有"] = calmar(rets[(c, sn, "持有")].reindex(span).fillna(0))
+            row["PBO"] = validation.pbo_cscv(pd.DataFrame(cand), S=10)["pbo"]
             wf_rows.append(row)
             picks += list(wf["folds"]["选中参数"])
     wf = pd.DataFrame(wf_rows)
@@ -146,6 +157,13 @@ def main(argv: list[str]) -> int:
         g["卡玛中位数"] = g["卡玛中位数"].map(lambda x: f"{x:.2f}")
         lines += [f"## {name}", "", g.to_markdown(), ""]
 
+    shown = pairs.copy()
+    shown["卡玛差中位数"] = shown["卡玛差中位数"].map(lambda x: f"{x:+.3f}")
+    shown["胜出占比"] = shown["胜出占比"].map(lambda x: f"{x:.0%}")
+    shown["Wilcoxon p"] = shown["Wilcoxon p"].map(lambda x: f"{x:.3f}")
+    lines += ["## 配对检验（同一标的×策略上，方案卡玛 − B 卡玛）", "",
+              "比通过率可靠：连续指标、逐组配对。置信区间跨过 0 = 没有证据表明更好。"
+              "ETF 之间高度相关，真实有效样本更少，p 值偏乐观。", "", shown.to_markdown(index=False), ""]
     if len(wf):
         s = wf[["WF选择", "固定B", "固定C", "固定E", "持有"]]
         lines += ["## Walk-Forward（训练 3 年 → 检验 1 年，滚动；只看样本外拼接段）", "",
@@ -154,7 +172,10 @@ def main(argv: list[str]) -> int:
                   "| 样本外卡玛中位数 | " + " | ".join(f"{x:.2f}" for x in s.median()) + " |",
                   f"| 胜过固定B的组数占比 | {(s['WF选择'] > s['固定B']).mean():.0%} | — | "
                   f"{(s['固定C'] > s['固定B']).mean():.0%} | {(s['固定E'] > s['固定B']).mean():.0%} | — |", "",
-                  "各方案被选中的次数：" + "，".join(f"{k} {v}" for k, v in pd.Series(picks).value_counts().items()), ""]
+                  "各方案被选中的次数：" + "，".join(f"{k} {v}" for k, v in pd.Series(picks).value_counts().items()), "",
+                  f"**回测过拟合概率 PBO**（Bailey 等 2015，CSCV，每组在 B/C/D/E 中挑样本内夏普最高者）："
+                  f"中位数 {wf['PBO'].median():.0%}，PBO > 50% 的组占 {(wf['PBO'] > 0.5).mean():.0%}。"
+                  "PBO 接近或超过 50% 说明“挑最好的方案”和随机挑没有区别。", ""]
 
     def yr_line(df: pd.DataFrame, title: str) -> list[str]:
         return [f"| {title} | {len(df)} | {df['持有'].median():.1%} | {df['B'].median():.1%} | {df['C'].median():.1%} | "
@@ -166,8 +187,11 @@ def main(argv: list[str]) -> int:
               *yr_line(bear, "熊市年（持有 < −10%）"), *yr_line(bull, "牛市年（持有 > +10%）"), ""]
     lines += ["> 回测不代表未来收益，本报告不构成投资建议。"]
 
+    if not demo:
+        registry.log("样本外检验", "B/C/D/E × 4策略 × 全部标的", len(CFGS),
+                     f"C−B 卡玛中位差 {pairs.iloc[0]['卡玛差中位数']:+.3f}")
     OUT.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M") + ("_demo" if demo else "")
     md = OUT / f"样本外检验_{stamp}.md"
     md.write_text("\n".join(lines), encoding="utf-8")
     res.to_csv(OUT / f"样本外检验_{stamp}.csv", index=False, encoding="utf-8-sig")

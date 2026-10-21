@@ -5,3 +5,9 @@ data/cache/
 .pytest_cache/
 .claude/
 *.log
+.pytest_tmp/
+# personal / generated locally
+notify.json
+reports/daily/
+reports/auto.log
+reports/*_demo.*

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Unit tests
+        run: python -m pytest tests -q -p no:cacheprovider
+      # GitHub runners are overseas and A-share data APIs are often unreachable there,
+      # so pipelines run on offline demo data; real-data validation runs locally (auto_run.py).
+      - name: Validation pipeline (demo data)
+        run: python validate_ashare.py --demo
+      - name: Daily automation (demo data)
+        run: python auto_run.py daily --demo
+      - name: Report regression check
+        run: python compare_reports.py

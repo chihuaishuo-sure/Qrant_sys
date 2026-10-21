@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from qrant import data, metrics, pipeline
+from qrant import compare, data, metrics, pipeline, quality, registry, validation
 from dataclasses import replace
 
 from qrant.config import BENCHMARK_INDEX, DEFAULT_WATCHLIST, RiskConfig
@@ -64,6 +64,13 @@ def main(argv: list[str]) -> int:
     if not datas:
         print("没有可用数据，请检查网络后重试。")
         return 1
+    qc = quality.check_many(datas)
+    bad = set(qc.loc[qc["级别"] == "错误", "代码"])
+    for r in qc.itertuples(index=False):
+        print(f"  {'✗' if r.级别 == '错误' else '⚠'} {r.代码} {r.日期} {r.问题}")
+    if bad:
+        print(f"  数据有错误的标的不参与验证：{', '.join(sorted(bad))}")
+        datas = {c: d for c, d in datas.items() if c not in bad}
 
     print("[2/3] 回测 …")
     rows = []
@@ -76,6 +83,10 @@ def main(argv: list[str]) -> int:
                 print(f"  ✗ {c} {s}: {e}")
                 continue
             m = a.metrics
+            rk = a.results["风控策略"]
+            rt = validation.random_timing_test(df.loc[a.start:, "close"].pct_change(), rk.exposure.shift(1),
+                                               n_sims=300, cash_rate=BASE.cash_rate)
+            psr = validation.probabilistic_sharpe(rk.returns)
             rows.append({
                 "代码": c, "名称": DEFAULT_WATCHLIST.get(c, c), "策略": NAMES[s],
                 "区间": f"{a.start:%Y-%m}~{df.index[-1]:%Y-%m}",
@@ -85,6 +96,7 @@ def main(argv: list[str]) -> int:
                 "风控_卡玛": m["风控策略"]["卡玛比率"], "同仓位_卡玛": m["同仓位基准"]["卡玛比率"],
                 "平均仓位": m["风控策略"]["平均仓位"], "成交笔数": m["风控策略"].get("成交笔数", 0),
                 "回撤降低": a.verdict["dd_cut"], "通过验收": a.verdict["passed"],
+                "随机择时p": rt["p"], "PSR": psr["psr"],
             })
             print(f"  {c} {NAMES[s]:6s} 回撤 {m['买入持有']['最大回撤']:.1%} → {m['风控策略']['最大回撤']:.1%}  "
                   f"卡玛 {m['买入持有']['卡玛比率']:.2f} → {m['风控策略']['卡玛比率']:.2f}  "
@@ -124,7 +136,7 @@ def main(argv: list[str]) -> int:
 
     print("[3/3] 生成报告 …")
     OUT.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M") + ("_demo" if demo else "")
     csv_path = OUT / f"A股验证_{stamp}.csv"
     md_path = OUT / f"A股验证报告_{stamp}.md"
     res.to_csv(csv_path, index=False, encoding="utf-8-sig")
@@ -135,6 +147,8 @@ def main(argv: list[str]) -> int:
     for k in ["持有_卡玛", "风控_卡玛", "同仓位_卡玛"]:
         show[k] = show[k].map(lambda v: f"{v:.2f}")
     show["通过验收"] = show["通过验收"].map({True: "✅", False: "❌"})
+    show["随机择时p"] = show["随机择时p"].map(lambda v: f"{v:.2f}")
+    show["PSR"] = show["PSR"].map(lambda v: f"{v:.0%}")
     by_s = res.groupby("策略").agg(通过率=("通过验收", "mean"), 回撤降低中位数=("回撤降低", "median"),
                                  风控卡玛中位数=("风控_卡玛", "median"), 持有卡玛中位数=("持有_卡玛", "median"))
     lines = [
@@ -143,10 +157,14 @@ def main(argv: list[str]) -> int:
         f"（空仓资金按年化 {BASE.cash_rate:.1%} 计息，所有对比线相同）；"
         "t 日收盘出信号、t+1 开盘成交，含 A 股全部交易成本。", "",
         "数据修正：" + ("；".join(NOTES) if NOTES else "无"), "",
+        "数据质量：" + ("全部通过" if qc.empty else f"{len(qc)} 个问题，{len(bad)} 个标的因错误被剔除"), "",
         "## 总览（按策略）", "",
         by_s.to_markdown(floatfmt=".2f") if _has_tabulate() else by_s.round(2).to_string(), "",
         f"**总体通过率：{res['通过验收'].mean():.0%}**（{int(res['通过验收'].sum())}/{len(res)}）。"
         "通过 = 回撤更小，且卡玛比率同时高于买入持有和同等平均仓位基准。", "",
+        f"**随机择时检验**：{(res['随机择时p'] < 0.05).sum()}/{len(res)} 组的择时显著优于随机平移的同一仓位序列（p < 0.05）。"
+        "p 值 = 随机择时卡玛不低于真实择时的比例；p 大说明“择时收益”可能只是运气。"
+        "PSR = 风控策略真实夏普 > 0 的概率（Bailey & López de Prado 2012）。", "",
         "## 明细", "",
         show.to_markdown(index=False) if _has_tabulate() else show.to_string(index=False), "",
     ]
@@ -160,6 +178,18 @@ def main(argv: list[str]) -> int:
     md_path.write_text("\n".join(lines), encoding="utf-8")
 
     print(f"\n总体通过率 {res['通过验收'].mean():.0%}；回撤降低中位数 {res['回撤降低'].median():.0%}")
+    if not demo:  # 演示数据不算研究试验
+        registry.log("A股验证", f"{len(datas)}标的×{len(STRATS)}策略 + 方案{''.join(k[0] for k in VARIANTS)}",
+                     len(VARIANTS), f"通过率{res['通过验收'].mean():.0%}")
+    if not demo:
+        prev = [p for p in compare.latest_reports(OUT, n=3) if p != csv_path][-1:]
+        if prev:
+            cmp = compare.compare(compare.load_report(prev[0]), compare.load_report(csv_path))
+            s = compare.summary(cmp)
+            cmp_path = OUT / f"对比_{prev[0].stem.split('_', 1)[-1]}_vs_{stamp}.md"
+            cmp_path.write_text(compare.to_markdown(cmp, prev[0].stem, csv_path.stem), encoding="utf-8")
+            print(f"与上一份报告对比：通过率 {s['旧通过率']:.0%} → {s['新通过率']:.0%}，"
+                  f"数据变化 {s['数据变化行']} 行，代码退化 {s['代码退化行']} 行（{cmp_path.name}）")
     print(f"报告已保存：\n  {md_path}\n  {csv_path}")
     return 0
 
