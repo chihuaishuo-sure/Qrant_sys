@@ -1,6 +1,6 @@
 # 🛡️ Qrant —— 先求少亏的个人量化风控系统
 
-[![CI](https://github.com/OWNER/Qrant_sys/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/Qrant_sys/actions/workflows/ci.yml)
+[![CI](https://github.com/chihuaishuo-sure/Qrant_sys/actions/workflows/ci.yml/badge.svg)](https://github.com/chihuaishuo-sure/Qrant_sys/actions/workflows/ci.yml)
 
 基于 Python + Streamlit 的个人量化工作台。核心理念：**不预测涨跌，而是用有学术证据的规则控制亏损**，并用一整套统计检验识别“回测好看、实盘亏钱”的假优势。
 
