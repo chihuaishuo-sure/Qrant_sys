@@ -20,5 +20,6 @@ pause
 exit /b 1
 :fail
 echo [Qrant] Failed to create the scheduled task.
+echo [Qrant] If it says "Access is denied": right-click this file and choose "Run as administrator".
 pause
 exit /b 1

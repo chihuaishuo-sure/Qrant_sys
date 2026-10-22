@@ -99,7 +99,8 @@ def daily(demo: bool = False) -> dict:
     if not qc.empty or failed:
         lines += ["## ⚠ 数据问题", ""] + [f"- {r.代码} {r.级别}：{r.问题}" for r in qc.itertuples()] + \
                  [f"- 获取失败 {f}" for f in failed] + [""]
-    lines += ["## 需要操作（目标仓位变化 > 10 个百分点）", ""] + ([f"- {a}" for a in actions] or ["- 无"]) + [""]
+    no_action = "- 无" if prev_files else "- 首次运行，没有上一交易日的信号可对比（明天起列出变化）"
+    lines += ["## 需要操作（目标仓位变化 > 10 个百分点）", ""] + ([f"- {a}" for a in actions] or [no_action]) + [""]
     if len(sig):
         show = sig[["代码", "名称", "状态", "目标仓位", "收盘价", "建议止损价", "大盘过滤"]].copy()
         show["目标仓位"] = show["目标仓位"].map(lambda v: f"{v:.0%}")
