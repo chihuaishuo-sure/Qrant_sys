@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from qrant import data, judge, judge_bank  # noqa: E402
+from qrant import data, judge, judge_bank, judge_bank_holdout  # noqa: E402
 
 
 def test_bank_labels_match_execution_oracle():
@@ -15,6 +15,17 @@ def test_bank_labels_match_execution_oracle():
     assert sum(c.intent for c in cases) >= 15 and sum(not c.intent for c in cases) >= 15
     wrong = [c.id for c in cases if judge_bank.oracle(c.code, df) != c.intent]
     assert not wrong, f"题库设计意图与执行判卷不一致：{wrong}"
+
+
+def test_holdout_bank_labels_and_independence_from_prompt():
+    df = data.demo_data("510300")
+    cases = judge_bank_holdout.build()
+    wrong = [c.id for c in cases if judge_bank.oracle(c.code, df) != c.intent]
+    assert not wrong, f"留出题库意图与执行判卷不一致：{wrong}"
+    # 留出题“清单外”类的关键写法不能出现在提示词里，否则就不是留出了
+    for c in cases:
+        if c.kind == "清单外":
+            assert judge._norm(c.planted) not in judge._norm(judge.SYSTEM), c.id
 
 
 def test_oracle_catches_subtle_and_early_lookahead():

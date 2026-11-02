@@ -11,3 +11,4 @@ notify.json
 reports/daily/
 reports/auto.log
 reports/*_demo.*
+reports/.进度_*

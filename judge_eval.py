@@ -5,6 +5,8 @@
     python judge_eval.py --think                 # 开思考（慢很多）
     python judge_eval.py --votes 3               # 采样 3 次取最严
     python judge_eval.py --model qwen3.6:35b-a3b-coding-mtp-q4_K_M
+    python judge_eval.py --think --bank holdout  # 留出题库：提示词清单之外的写法，测泛化能力
+    python judge_eval.py --think --resume        # 中断后接着跑（每答完一题都会存进度）
 
 标准答案来自执行判卷（qrant/judge_bank.oracle），不是人工标注。
 “标记” = 裁决为 前视 或 不确定（不确定会转人工复查，所以对召回率算作抓到、对误报率算作误报）。
@@ -18,7 +20,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from qrant import data, judge, judge_bank
+from qrant import data, judge, judge_bank, judge_bank_holdout
 
 OUT = Path(__file__).resolve().parent / "reports"
 
@@ -42,24 +44,31 @@ def rate(num: int, den: int) -> str:
 def main(argv: list[str]) -> int:
     think = "--think" in argv
     votes = int(argv[argv.index("--votes") + 1]) if "--votes" in argv else 1
+    max_tokens = int(argv[argv.index("--max-tokens") + 1]) if "--max-tokens" in argv else 8192
     model = argv[argv.index("--model") + 1] if "--model" in argv else judge.DEFAULT_MODEL
-    mode = f"{model}｜{'思考' if think else '不思考'}｜{'单次 temperature=0' if votes == 1 else f'{votes} 次采样取最严'}"
+    bank = argv[argv.index("--bank") + 1] if "--bank" in argv else "main"
+    mode = (f"{model}｜{'思考' if think else '不思考'}｜{'单次 temperature=0' if votes == 1 else f'{votes} 次采样取最严'}"
+            f"｜{'留出题库（清单外写法）' if bank == 'holdout' else '主题库'}")
     print(f"[裁判A评测] {mode}")
 
     df = data.demo_data("510300")
-    cases = judge_bank.build()
+    cases = judge_bank_holdout.build() if bank == "holdout" else judge_bank.build()
+    tag = f"{model.replace(':', '-')}_{'think' if think else 'nothink'}_v{votes}" + ("_holdout" if bank == "holdout" else "")
+    ckpt = OUT / f".进度_{tag}.csv"  # 每答完一题就存一次，中断后用 --resume 接着跑
     reuse = {}
-    if "--retry-from" in argv:  # 沿用上次已有答案的题，只重跑调用出错的题
-        prev = pd.read_csv(argv[argv.index("--retry-from") + 1], encoding="utf-8-sig")
+    src = argv[argv.index("--retry-from") + 1] if "--retry-from" in argv else (ckpt if "--resume" in argv else None)
+    if src is not None and Path(src).exists():  # 沿用已有答案的题，只跑没答过或调用出错的题
+        prev = pd.read_csv(src, encoding="utf-8-sig")
         reuse = {r["题目"]: r for r in prev.to_dict("records") if r["裁决"] != "错误"}
-        print(f"  沿用 {len(reuse)} 题，重跑 {len(cases) - len(reuse)} 题")
+        print(f"  沿用 {len(reuse)} 题，需要跑 {len(cases) - len(reuse)} 题", flush=True)
+    OUT.mkdir(exist_ok=True)
     rows = []
     for i, c in enumerate(cases, 1):
         if c.id in reuse:
             rows.append({k: (None if pd.isna(v) else v) for k, v in reuse[c.id].items()})
             continue
         truth = judge_bank.oracle(c.code, df)
-        v = judge.review_votes(c.code, n=votes, model=model, think=think)
+        v = judge.review_votes(c.code, n=votes, model=model, think=think, max_tokens=max_tokens)
         flagged = v.verdict in ("前视", "不确定")
         rows.append({"题目": c.id, "类型": c.kind, "真实有前视": truth, "裁决": v.verdict, "标记": flagged,
                      "正确": flagged == truth, "定位正确": located(v.findings, c.planted) if truth else None,
@@ -68,6 +77,7 @@ def main(argv: list[str]) -> int:
                      "秒": round(v.seconds, 1), "tokens": v.tokens, "错误": v.error})
         print(f"  [{i:2d}/{len(cases)}] {c.id:28s} 真实={'前视' if truth else '干净'}  裁决={v.verdict}"
               f"  {'✓' if flagged == truth else '✗'}  {v.seconds:.1f}s", flush=True)
+        pd.DataFrame(rows).to_csv(ckpt, index=False, encoding="utf-8-sig")
     r = pd.DataFrame(rows)
     r["真实有前视"] = r["真实有前视"].astype(bool)
     r["标记"] = r["标记"].astype(bool)
@@ -83,7 +93,6 @@ def main(argv: list[str]) -> int:
     traps = neg[neg["类型"].str.startswith("陷阱")]
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    tag = f"{model.replace(':', '-')}_{'think' if think else 'nothink'}_v{votes}"
     lines = [f"# 裁判 A（代码前视审查）评测 · {datetime.now():%Y-%m-%d %H:%M}", "",
              f"模式：{mode}；提示词版本 {judge.PROMPT_VERSION}；题库 {len(r_all)} 题，有效作答 {len(r)} 题"
              f"（有前视 {len(pos)}，干净 {len(neg)}，其中陷阱题 {len(traps)}）。标准答案来自执行判卷。", ""]
@@ -108,7 +117,6 @@ def main(argv: list[str]) -> int:
         failed = r_all[r_all["裁决"] == "错误"]
         lines += ["## 调用出错的题", "", failed[["题目", "真实有前视", "秒", "错误"]].to_markdown(index=False), ""]
     lines += ["## 全部明细", "", r_all.drop(columns=["错误"]).to_markdown(index=False), ""]
-    OUT.mkdir(exist_ok=True)
     md = OUT / f"裁判A评测_{stamp}_{tag}.md"
     md.write_text("\n".join(lines), encoding="utf-8")
     r_all.to_csv(md.with_suffix(".csv"), index=False, encoding="utf-8-sig")

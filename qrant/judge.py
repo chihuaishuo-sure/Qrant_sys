@@ -96,11 +96,12 @@ def decide(raw: dict, code: str) -> Verdict:
 
 
 def review(code: str, model: str = DEFAULT_MODEL, think: bool = False, temperature: float = 0.0,
-           seed: int = 0, url: str = OLLAMA_URL, timeout: float = 600) -> Verdict:
+           seed: int = 0, url: str = OLLAMA_URL, timeout: float = 1800, max_tokens: int = 8192) -> Verdict:
     body = {
         "model": model, "stream": False, "think": think, "format": SCHEMA,
         # num_predict 封顶：思考模式偶尔陷入循环，不封顶会一直生成到超时；num_ctx 留足空间给思考 + JSON
-        "options": {"temperature": temperature, "seed": seed, "num_ctx": 16384, "num_predict": 8192},
+        "options": {"temperature": temperature, "seed": seed, "num_ctx": max(16384, max_tokens + 4096),
+                    "num_predict": max_tokens},
         "messages": [{"role": "system", "content": SYSTEM},
                      {"role": "user", "content": f"请审查下面的代码：\n```python\n{code}\n```"}],
     }
