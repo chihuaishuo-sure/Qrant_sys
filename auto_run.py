@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from qrant import data, notify, pipeline, quality
+from qrant import data, journal, notify, pipeline, quality
 from qrant.config import BENCHMARK_INDEX, DEFAULT_WATCHLIST, RiskConfig
 
 ROOT = Path(__file__).resolve().parent
@@ -110,6 +110,23 @@ def daily(demo: bool = False) -> dict:
         show["目标权重"] = show["目标权重"].map(lambda v: f"{v:.1%}")
         show["金额"] = show["金额"].map(lambda v: f"{v:,.0f}")
         lines += [f"## 组合建议持仓（资金 {CAPITAL:,} 元，月度再平衡）", "", show.to_markdown(index=False), ""]
+    acc = journal.load_account() if not demo else None
+    if acc is not None:  # 有实盘账户：按实际持仓给出明日具体股数，并更新实盘对比报告
+        try:
+            adj, ro, rc = journal.load_prices(acc.跟踪标的, acc.开始日期)
+            trades = journal.load_trades()
+            acts = journal.next_actions(acc, trades, adj, rc, bench)
+            show = acts.copy()
+            show["目标仓位"] = show["目标仓位"].map(lambda v: f"{v:.0%}")
+            lines += [f"## 实盘账户：明日开盘（起始资金 {acc.起始资金:,.0f} 元）", "", show.to_markdown(index=False), "",
+                      "成交后记账：`python trade_log.py buy/sell 日期 代码 股数 成交价 --fee 费用`；"
+                      "没按信号做也记一笔 `skip`。", ""]
+            res = journal.analyze(acc, trades, adj, ro, rc, bench)
+            (journal.DIR / f"实盘对比_{today:%Y%m%d}.md").write_text(journal.report_markdown(acc, res, acts),
+                                                                  encoding="utf-8")
+            actions += [f"实盘 {r.代码}：{r.明日开盘}" for r in acts.itertuples() if r.明日开盘 != "不动"]
+        except Exception as e:  # noqa: BLE001
+            lines += [f"## 实盘账户", "", f"- 生成失败：{str(e)[:120]}", ""]
     lines += ["> 回测不代表未来收益，不构成投资建议。"]
     md = "\n".join(lines)
     (DAILY / f"每日信号_{tag}.md").write_text(md, encoding="utf-8")

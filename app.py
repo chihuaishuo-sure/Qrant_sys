@@ -11,7 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from qrant import __version__, data, metrics, pipeline, quality, validation
+from qrant import __version__, data, journal, metrics, pipeline, quality, validation
 from qrant import backtest as bt
 from qrant.config import (BENCHMARK_INDEX, BENCHMARK_NAME, DEFAULT_WATCHLIST, CostModel, RiskConfig,
                           is_ashare_equity, is_etf, price_limit)
@@ -26,7 +26,7 @@ st.set_page_config(page_title="Qrant 量化风控", page_icon="🛡️", layout=
 st.markdown(CSS, unsafe_allow_html=True)
 
 KIND_LABEL = {"自动识别": "auto", "ETF/场内基金": "etf", "A股个股": "stock", "指数": "index"}
-PAGES = ["🏠 今日信号", "📈 策略回测", "🧺 组合配置", "🔬 稳健性检验", "🛡️ 风控工具箱", "📘 使用说明"]
+PAGES = ["🏠 今日信号", "📈 策略回测", "🧺 组合配置", "🔬 稳健性检验", "🛡️ 风控工具箱", "📒 实盘记录", "📘 使用说明"]
 
 # ------------------------------------------------------------------ 侧边栏
 with st.sidebar:
@@ -662,6 +662,98 @@ def page_tools():
         st.markdown("这就是本系统“先求少亏”的数学原因：**把最大回撤从 −50% 压到 −20%，回本所需涨幅从 100% 降到 25%。**")
 
 
+# ================================================================== 页面：实盘记录
+@st.cache_data(ttl=3600, show_spinner=False)
+def _journal_prices(codes: tuple[str, ...], start: str):
+    return journal.load_prices(list(codes), start)
+
+
+def page_journal():
+    hero("📒 实盘记录", "小额实盘检验的是执行：你有没有按信号做、成交价差多少、和纸面账户差多少。")
+    st.caption("记录保存在本机 journal/ 文件夹，不会上传到 GitHub。")
+    acc = journal.load_account()
+    if acc is None:
+        with st.form("jinit"):
+            st.markdown("#### 建立实盘账户")
+            c1, c2, c3 = st.columns(3)
+            cap = c1.number_input("起始资金（元）", 1000, 10_000_000, 3000, 500)
+            start = c2.date_input("开始日期", value=date.today())
+            minc = c3.radio("佣金", ["免五（无最低佣金）", "最低 5 元"], help="3000 元级别的资金，5 元最低佣金每年会吃掉 2% 以上")
+            codes = st.multiselect("跟踪标的（建议 1–2 只，一手价格要买得起）", list(DEFAULT_WATCHLIST),
+                                   default=["510300"], format_func=lambda c: f"{c} {name_of(c)}")
+            if st.form_submit_button("建立账户", type="primary") and codes:
+                journal.init(journal.Account(起始资金=float(cap), 开始日期=start.isoformat(), 跟踪标的=codes,
+                                             最低佣金=0.0 if minc.startswith("免五") else 5.0))
+                st.rerun()
+        return
+
+    try:
+        adj, ro, rc = _journal_prices(tuple(acc.跟踪标的), acc.开始日期)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"行情获取失败：{e}")
+        return
+    bench = load_bench()
+    trades = journal.load_trades()
+    acts = journal.next_actions(acc, trades, adj, rc, bench)
+
+    st.markdown("#### 明日开盘操作")
+    show = acts.copy()
+    show["目标仓位"] = show["目标仓位"].map(lambda v: pct(v, 0))
+    table(show, hide_index=True)
+
+    with st.expander("✍️ 记一笔", expanded=False):
+        with st.form("jadd", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            d = c1.date_input("日期", value=date.today())
+            code = c2.selectbox("代码", acc.跟踪标的, format_func=lambda c: f"{c} {name_of(c)}")
+            side = c3.selectbox("方向", journal.SIDES, help="没按信号操作请选“未执行”并写明原因；分红可不记，系统会自动补")
+            c4, c5, c6 = st.columns(3)
+            qty = c4.number_input("数量（股）", 0, 10_000_000, 100, 100)
+            price = c5.number_input("成交价 / 分红到账金额", 0.0, 1_000_000.0, 0.0, 0.001, format="%.3f")
+            fee = c6.number_input("费用（元）", 0.0, 1000.0, 0.0, 0.01)
+            note = st.text_input("备注")
+            if st.form_submit_button("保存", type="primary"):
+                try:
+                    if side == "分红":
+                        journal.add_trade(d, code, side, amount=price, note=note)
+                    elif side == "未执行":
+                        journal.add_trade(d, code, side, note=note)
+                    else:
+                        journal.add_trade(d, code, side, qty, price, fee, note=note)
+                    st.success("已保存")
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(str(e))
+
+    res = journal.analyze(acc, trades, adj, ro, rc, bench)
+    s = res["summary"]
+    c = st.columns(4)
+    with c[0]:
+        card("实际账户", pct(s["实际收益"], 2, True), f"起始 {acc.起始资金:,.0f} 元")
+    with c[1]:
+        card("纸面账户（严格按信号）", pct(s["纸面收益"], 2, True), f"买入持有 {pct(s['持有收益'], 2, True)}")
+    with c[2]:
+        card("执行差（实际 − 纸面）", pct(s["执行差"], 2, True), "越接近 0 越好", "q-gold")
+    with c[3]:
+        card("执行率", f"{s['按时']}/{s['系统交易数']}",
+             f"延迟 {s['延迟']} · 未执行 {s['未执行']} · 计划外 {s['计划外']}")
+    if len(res["curves"]):
+        chart(equity_fig({k: v for k, v in res["curves"].items()}))
+    t1, t2 = st.tabs(["信号与执行明细", "交易记录"])
+    with t1:
+        if len(res["matches"]):
+            table(res["matches"], hide_index=True)
+        else:
+            st.info("开始日期以来系统还没有发出交易信号。")
+        if not np.isnan(s["平均滑点bp"]):
+            st.caption(f"平均滑点 {s['平均滑点bp']:.1f} 个基点（相对当天开盘价，正数 = 对你不利）。")
+    with t2:
+        table(trades if len(trades) else pd.DataFrame(columns=journal.COLS), hide_index=True)
+        if len(res["auto_dividends"]):
+            st.caption("以下分红由系统按除息前持股自动补记：")
+            table(res["auto_dividends"], hide_index=True)
+
+
 # ================================================================== 页面：使用说明
 def page_help():
     hero("📘 使用说明", "三分钟上手，以及你需要知道的方法论与局限。")
@@ -697,4 +789,4 @@ def page_help():
 
 
 {PAGES[0]: page_signals, PAGES[1]: page_backtest, PAGES[2]: page_portfolio, PAGES[3]: page_robust,
- PAGES[4]: page_tools, PAGES[5]: page_help}[page]()
+ PAGES[4]: page_tools, PAGES[5]: page_journal, PAGES[6]: page_help}[page]()
